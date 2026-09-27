@@ -5,6 +5,8 @@ A dual-component management application for a sports club / gym:
 - **WPF Desktop App (Modern/)** — internal server, attendance validation, member/finance/inventory management
 - **ASP.NET Core Web API (WebApi/)** — HTTP bridge that external clients (web browser, mobile) use to check subscriptions remotely
 
+> **Academic context:** This project was developed as a bachelor's thesis (licență). The AI Analysis module relies on a custom-trained model that is not included in this repository — see [AI Analysis Module](#ai-analysis-modul-analiza-ai) below.
+
 ---
 
 ## Table of Contents
@@ -16,10 +18,11 @@ A dual-component management application for a sports club / gym:
 5. [Running the Application](#running-the-application)
 6. [How the Subscription Flow Works](#how-the-subscription-flow-works)
 7. [Database](#database)
-8. [Project Structure](#project-structure)
-9. [Features](#features)
-10. [Troubleshooting](#troubleshooting)
-11. [License](#license)
+8. [AI Analysis Module — Analiza AI](#ai-analysis-modul-analiza-ai)
+9. [Project Structure](#project-structure)
+10. [Features](#features)
+11. [Troubleshooting](#troubleshooting)
+12. [License](#license)
 
 ---
 
@@ -243,6 +246,250 @@ The database is created empty on first run. You need to add data through the WPF
 
 ---
 
+## AI Analysis Module — Analiza AI
+
+> ⚠️ **IMPORTANT FOR THESIS REVIEWERS:** The AI Analysis feature is fully implemented in code but **depends on a custom-trained machine learning model (`topaiever.pt`) that is NOT included in this repository**. Without this file, the AI module will crash at runtime. The model must be trained separately and placed in the application directory before the feature can be used.
+
+---
+
+### Overview
+
+The **Analiza AI** module provides automated fight video analysis for club athletes. It processes a recorded sparring or match video, detects punches in real time, attributes each punch to the correct fighter (attacker vs. defender), classifies the target zone (head vs. body), and tracks:
+
+- Punches landed (head / body)
+- Punches received (head / body)
+- Missed punches
+- A visualised output video with on-screen scoring and annotations
+
+All results are saved back to the athlete's record in the SQLite database.
+
+---
+
+### Files Involved
+
+| File | Role |
+|------|------|
+| `Modern/ViewModel/AnalizaAiViewModel.cs` | ViewModel for the AI analysis window — provides the filtered member list and theme handling |
+| `Modern/View/AnalizaAiView.xaml(.cs)` | WPF window with search box and member list — each member row opens the analysis flow |
+| `Modern/Commands/AnalizaAICommand.cs` | Command that opens a video file dialog, copies the video to `VideoAi/`, calls the Python analysis engine, parses the JSON result, and updates the database |
+| `Modern/Commands/DeschidereAnalizaAiCommand.cs` | Opens the `AnalizaAiView` window from the main dashboard |
+| `Modern/demo.py` | **The AI engine** — Python script containing the `analyze_fight()` function that performs all computer-vision processing |
+| `Modern/requirements.txt` | Python dependencies: `ultralytics`, `opencv-python`, `numpy` |
+| `Modern/Model/FighterStats.cs` | C# data transfer class matching the JSON output from `demo.py` |
+| `Modern/Model/CSnakesInitialization.cs` | Initializes the CSnakes bridge — loads the Python runtime and imports `demo.py` as a C#-callable module |
+
+---
+
+### How the AI Pipeline Works
+
+The flow is triggered when an admin selects a member from the Analiza AI window and then selects a video file.
+
+```
+[Admin selects member + video]
+           |
+           v
+[OpenFileDialog]  →  user picks .mp4/.avi/.mov/.mkv/.wmv
+           |
+           v
+[Video copied to]  →  VideoAi/{MemberName}{extension}
+           |
+           v
+[CSnakes call]  →  CSnakesInitialization._module.AnalyzeFight(
+                        video_path,
+                        member_name,
+                        "inamic",
+                        output_video_path
+                    )
+           |
+           v
+[demo.py — analyze_fight()]  →  PROCESSING PIPELINE (see below)
+           |
+           v
+[JSON result returned to C#]  →  deserialized into FighterStats
+           |
+           v
+[Database updated]  →  PumniNimeritiCap, PumniNimeritiCorp,
+                         PumniIncasatiCap, PumniIncasatiCorp,
+                         PumniRatati  (incremented for the selected member)
+```
+
+---
+
+### The Python Pipeline (`demo.py` — `analyze_fight()`)
+
+The function `analyze_fight(video_path, fighter1_name, fighter2_name, output_path)` performs the following steps for every frame of the input video:
+
+**1. Fighter segmentation (SAM2)**
+
+- On the first frame, the user is prompted (via `cv2.selectROI`) to draw a bounding box around each of the two fighters
+- **SAM2** (`sam2.1_l.pt`, via Ultralytics) then tracks both fighters across the entire video, producing per-frame segmentation masks
+- Masks are used throughout the pipeline for overlap calculations and visual overlays
+
+**2. Punch detection (YOLO)**
+
+- A custom YOLOv8 model (`topaiever.pt`) runs on every frame and detects punch events
+- Only detections with class label `"punch"` and confidence ≥ **0.4** are kept
+- Each detection provides a bounding box `(x1, y1, x2, y2)` and a confidence score
+
+**3. Punch attribution**
+
+For each detected punch, the pipeline determines:
+
+- **Who threw it (attacker):** Combines SAM2 mask overlap (80% weight) with motion direction (40% weight). A strict margin check ensures the attacker is clearly distinguishable from the defender — if the two overlap scores are too close, the punch is discarded as unattributed.
+- **Who was hit (defender):** Computes overlap of the punch box with the defender's head zone and body zone. The higher overlap wins, yielding a hit type of `"head"` or `"body"`.
+- **Missed punches:** If a punch was thrown by a known attacker but no defender overlap exceeds the threshold, it is registered as a miss.
+
+**4. Hit registration with cooldown**
+
+- A frame-level cooldown (`HIT_COOLDOWN = 10` frames) prevents double-counting the same punch across consecutive frames
+- The defender also has a shorter cooldown (`HIT_COOLDOWN / 2`) to avoid registering counter-punches too quickly
+
+**5. Visual output**
+
+For every frame, the pipeline draws:
+
+- SAM2 segmentation masks as semi-transparent overlays (green for fighter 0, red for fighter 1)
+- Head zone (yellow rectangle) and body zone (magenta rectangle) for each fighter
+- Fighter bounding boxes with name labels and live stats (`Head: X  Body: Y`, `Received: H:X B:Y`)
+- Punch bounding boxes colour-coded:
+  - **Green** — successful hit (attributed + registered)
+  - **Yellow** — punch detected, attacker known, but no hit registered (miss)
+  - **Grey** — unattributed punch
+- Labels on each punch: `"punch 85%"` plus `"Fighter1 -> Fighter2 (HEAD)"` or `"unattributed"`
+- A scoreboard overlay in the top-left corner showing each fighter's landed/received totals
+
+**6. JSON output**
+
+At the end, the function returns a JSON string with this structure:
+
+```json
+{
+  "output_video": "output_hit_tracking.mp4",
+  "fighter1": "NumeSportiv",
+  "fighter2": "inamic",
+  "results": {
+    "NumeSportiv": {
+      "head_landed": 12,
+      "body_landed": 8,
+      "total_landed": 20,
+      "head_received": 5,
+      "body_received": 3,
+      "total_received": 8,
+      "head_missed": 3,
+      "body_missed": 2,
+      "total_missed": 5
+    },
+    "inamic": {
+      "...": "..."
+    }
+  }
+}
+```
+
+The C# side only reads the selected member's entry from `results` and discards the rest.
+
+---
+
+### What Gets Saved to the Database
+
+After the Python call returns, `AnalizaAICommand` increments the following fields on the `Oameni` record for the selected member:
+
+| Field | Source in JSON | Meaning |
+|-------|---------------|---------|
+| `PumniNimeritiCap` | `results[name].head_landed` | Punches landed to the head |
+| `PumniNimeritiCorp` | `results[name].body_landed` | Punches landed to the body |
+| `PumniIncasatiCap` | `results[name].head_received` | Punches received to the head |
+| `PumniIncasatiCorp` | `results[name].body_received` | Punches received to the body |
+| `PumniRatati` | `results[name].total_missed` | Punches thrown but missed |
+
+The output video file (`VideoAi/{NumeSportiv}.mp4`) is **not** stored in the database — it remains as a file on disk in the `VideoAi/` folder next to the application executable.
+
+---
+
+### ⚠️ Missing Model — `topaiever.pt`
+
+**This is the single most important caveat for anyone trying to run or evaluate the AI module.**
+
+The file `topaiever.pt` is a **custom-trained YOLOv8 model** that detects punches in combat-sports video. It is referenced on line 9 of `demo.py`:
+
+```python
+punch_model = YOLO('topaiever.pt')
+```
+
+This file:
+
+- **Does NOT exist in the GitHub repository**
+- **Must be present in the application's working directory** (next to `demo.py`) at runtime
+- Was trained externally as part of the thesis work
+- Is specific to this project — it is not a standard Ultralytics model available via `pip` or the Ultralytics model hub
+
+**If `topaiever.pt` is missing, the application will crash** when the user attempts to run an AI analysis, because `YOLO('topaiever.pt')` is executed at module import time in `demo.py`.
+
+**To make the AI module work, you must:**
+
+1. Train or obtain a YOLOv8 punch-detection model and export it as `topaiever.pt`
+2. Place `topaiever.pt` in the same directory as `demo.py` (i.e., `Modern/`) or in the application's output directory alongside the executable
+3. Ensure a Python environment with the dependencies from `requirements.txt` is available
+
+---
+
+### Secondary Model — `sam2.1_l.pt` (SAM2)
+
+The pipeline also uses **SAM2.1-Large** (`sam2.1_l.pt`) for fighter segmentation. This model:
+
+- **Is downloadable automatically** via Ultralytics the first time it is needed — it is a standard model available from the Ultralytics model registry
+- Is large (~7 GB) and requires a CUDA-capable GPU (`device="cuda:0"` in the pipeline)
+- Can be run on CPU in principle, but the pipeline as written targets GPU execution
+
+If training or running on a machine without a compatible GPU, the SAM2 segmentation step will fail or be impractically slow.
+
+---
+
+### Python Environment Setup
+
+The AI module requires a Python environment with the packages listed in `Modern/requirements.txt`:
+
+```txt
+ultralytics
+opencv-python
+numpy
+```
+
+Install them in the environment that CSnakes will use:
+
+```bash
+pip install -r Modern/requirements.txt
+```
+
+**CSnakes** (`CSnakes.Runtime` v1.2.1 in `Modern.csproj`) is the bridge that allows C# to call Python functions directly. It requires a compatible Python installation to be available on the system. Make sure the Python version used is compatible with CSnakes and with the `ultalytics`/`opencv-python`/`numpy` stack.
+
+---
+
+### How to Access the AI Module in the Application
+
+1. Log in to the WPF application
+2. From the main dashboard, open **Analiză AI** (button on the main window)
+3. The `AnalizaAiView` window opens, showing a searchable list of all club members
+4. Type a name in the search box to filter the list
+5. Click on the member you want to analyse
+6. An `OpenFileDialog` opens — select a fight/sparring video file (mp4, avi, mov, mkv, wmv)
+7. The application copies the video to `VideoAi/{MemberName}.{extension}` and calls the Python analysis engine
+8. When processing finishes, a message box confirms completion and the athlete's punch statistics are updated in the database
+9. Close the AI window and navigate to the athlete's detail profile (`Detalii Sportivi`) to see the updated stats graphically (pie charts via LiveCharts2 / SkiaSharp)
+
+---
+
+### Limitations and Known Behaviour
+
+- The pipeline assumes exactly **two fighters** in the video. The second fighter is hardcoded as `"inamic"` (opponent) — the system does not identify the opponent by name.
+- Fighter selection is **manual** — on the first frame, two ROI boxes must be drawn by the user via `cv2.selectROI`. This is a synchronous blocking call; the WPF UI will freeze until both boxes are drawn.
+- The punch detector (`topaiever.pt`) is custom and its accuracy depends entirely on the quality and diversity of the training data used to produce it.
+- Missed punches are inferred heuristically: any punch attributed to an attacker that does not result in a defender hit is counted as a miss. This can overcount misses in chaotic scenes.
+- The output video is written to disk but **never played back** inside the WPF application — it is saved for later offline review.
+- GPU is strongly recommended. The pipeline sets `device="cuda:0"` explicitly in the SAM2 predictor overrides.
+
+---
+
 ## Project Structure
 
 ```
@@ -257,6 +504,7 @@ LICENTAA/
 │   │   ├── FinanteView.xaml   # Finance / transactions
 │   │   ├── InventarView.xaml  # Inventory management
 │   │   ├── DetaliiSportiviView.xaml  # Athlete detail profiles
+│   │   ├── AnalizaAiView.xaml # AI analysis — member selection window
 │   │   └── ...
 │   ├── ViewModel/             # MVVM ViewModels
 │   │   ├── MainWindowViewModel.cs   # Starts HttpListener, loads data
@@ -265,11 +513,14 @@ LICENTAA/
 │   │   ├── FinanteViewModel.cs      # Finance view model
 │   │   ├── InventarViewModel.cs     # Inventory view model
 │   │   ├── DetaliSportiviViewModel.cs  # Athlete stats & chart
+│   │   ├── AnalizaAiViewModel.cs    # AI analysis window ViewModel
 │   │   ├── OameniViewModel.cs       # Member row model
 │   │   └── ...
-│   ├── Model/                 # Data models & server
+│   ├── Model/                 # Data models, DB context & AI server
 │   │   ├── Bazadateconnect.cs # EF Core DbContext (SQLite)
 │   │   ├── HttpServer.cs      # Embedded HttpListener (port 8000)
+│   │   ├── CSnakesInitialization.cs  # Python bridge initializer
+│   │   ├── FighterStats.cs    # JSON result DTO for AI analysis
 │   │   ├── Oameni.cs          # Member entity
 │   │   ├── Prezenta.cs        # Attendance entity
 │   │   ├── Inventar.cs        # Inventory entity
@@ -281,7 +532,11 @@ LICENTAA/
 │   │   ├── StergereOmCommand.cs
 │   │   ├── RenoireAbonamentCommand.cs
 │   │   ├── VanzareArticolCommand.cs
+│   │   ├── AnalizaAICommand.cs        # Triggers Python AI analysis
+│   │   ├── DeschidereAnalizaAiCommand.cs  # Opens AI window
 │   │   └── ...
+│   ├── demo.py                # AI fight analysis engine (Python)
+│   ├── requirements.txt       # Python deps: ultralytics, opencv-python, numpy
 │   └── imagini/              # Image assets (member photos, icons)
 │       ├── bec.png, gym.jpg, kickboxer.png, somo.jpg, ...
 │       └── placeholder.png, placeholderarticole.png
@@ -343,7 +598,11 @@ LICENTAA/
 - Add and remove admins/trainers
 
 ### AI Analysis (Analiza AI)
-- Filtered view of all members for AI-based analysis
+- Select a member and a fight video
+- Automated punch detection, attribution, and classification (head vs. body)
+- Real-time annotated output video with scoreboard
+- Results saved to the athlete's database record
+- ⚠️ **Requires a custom-trained `topaiever.pt` model not included in the repository**
 
 ### Theme Toggle
 - Dark theme (default) and light theme
@@ -413,11 +672,30 @@ Or add a user via code in `LoginCommand.cs` / a setup screen.
 
 **Cause:** Photo files must be in the `imagini/` folder next to the executable, named exactly as the member/item name with a supported extension (`.jpg`, `.jpeg`, `.png`, `.jfif`, `.webp`).
 
-**Fix:** Place photos in the `imagin
+**Fix:** Place photos in the `imagini/` folder in the output directory. For members: `imagini/{MemberName}.jpg`. For inventory items: `imagini/{ItemName}.png` etc.
 
-───
+### AI Analysis crashes immediately on video selection
 
-───ii/` folder in the output directory. For members: `imagini/{MemberName}.jpg`. For inventory items: `imagini/{ItemName}.png` etc.
+**Cause A — Missing `topaiever.pt`:** The custom YOLOv8 punch model is not in the application directory.
+
+**Fix:** Train or obtain `topaiever.pt` and place it next to `demo.py` (in `Modern/`) or in the application's output directory. Without this file the AI module cannot function.
+
+**Cause B — Python environment not ready:** CSnakes cannot find a compatible Python installation, or the required packages are missing.
+
+**Fix:**
+1. Install Python and add it to `PATH`
+2. Install the dependencies: `pip install -r Modern/requirements.txt`
+3. Verify CSnakes can load Python by checking that `CSnakesInitialization` succeeds at application startup
+
+**Cause C — No CUDA GPU:** The pipeline targets `cuda:0`. On a machine without a compatible GPU, SAM2 will fail or be extremely slow.
+
+**Fix:** Modify `demo.py` to use `device="cpu"` in the SAM2 predictor overrides, understanding that processing will be significantly slower.
+
+### AI analysis runs but no results appear in the database
+
+**Cause:** The JSON returned from Python may not contain the expected fighter name as a key, or `AnalizaAICommand` may not find the member in the results dictionary.
+
+**Fix:** Check that the `fighter1_name` argument passed to `AnalyzeFight` matches exactly the name of the member in the database. The command looks up `results[_omviewmodel.nume]` — if the names differ even by a space or diacritic, the lookup fails silently (the code shows `"Fighter not found in results."`).
 
 ---
 
@@ -427,4 +705,4 @@ This project is a personal academic application (licență — bachelor's thesis
 
 ---
 
-*ReadME generated after full code review — BALTHASAR-2 / MAGI System, NERV Headquarters.*
+*README compiled after full codebase review — BALTHASAR-2 / MAGI System, NERV Headquarters.*
