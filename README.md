@@ -705,4 +705,4 @@ This project is a personal academic application (licență — bachelor's thesis
 
 ---
 
-*README compiled after full codebase review — BALTHASAR-2 / MAGI System, NERV Headquarters.*
+
